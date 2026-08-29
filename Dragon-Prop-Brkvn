@@ -1,0 +1,691 @@
+-- ==============================================================================
+-- DRAGON CONTROL SCRIPT 
+-- ==============================================================================
+--BY | HANZ
+--==========================
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+
+-- Part transparan di kepala naga: CameraSubject (ganti teleport karakter)
+local camPart = Instance.new("Part")
+camPart.Name = "DragonHeadCam"
+camPart.Size = Vector3.new(1, 1, 1)
+camPart.Transparency = 1
+camPart.Anchored = true
+camPart.CanCollide = false
+camPart.CanTouch = false
+camPart.CanQuery = false
+camPart.CastShadow = false
+camPart.Massless = true
+camPart.Parent = camera
+
+---------------------------------------------------
+-- STATE MANAGEMENT
+---------------------------------------------------
+
+local Enabled = false
+local TeleportEnabled = false
+local CamEnabled = false
+local LoopColorEnabled = false
+local FollowPlayerEnabled = false
+local AttackEnabled = false
+
+local character, humanoid, hrp
+
+local function applyDragonCam()
+	if not camera or not camPart then return end
+	camera.CameraType = Enum.CameraType.Custom
+	camera.CameraSubject = camPart
+end
+
+local function restorePlayerCam()
+	if not camera then return end
+	camera.CameraType = Enum.CameraType.Custom
+	if humanoid then
+		camera.CameraSubject = humanoid
+	end
+end
+
+local function setDragonCam(on)
+	CamEnabled = on
+	if on and Enabled then
+		applyDragonCam()
+	else
+		restorePlayerCam()
+	end
+end
+
+character = player.Character or player.CharacterAdded:Wait()
+humanoid = character:WaitForChild("Humanoid")
+hrp = character:WaitForChild("HumanoidRootPart")
+
+player.CharacterAdded:Connect(function(char)
+	character = char
+	humanoid = char:WaitForChild("Humanoid")
+	hrp = char:WaitForChild("HumanoidRootPart")
+	if CamEnabled and Enabled then
+		task.defer(applyDragonCam)
+	end
+end)
+
+local baseSpeed = 0.8
+
+local TAIL_SEGMENT_DISTANCE = 6.0
+local tailSmoothness = 0.35
+local headTurnSpeed = 0.12
+
+local dragonPos = hrp.Position + Vector3.new(0, 8, 0)
+
+local Props = {}
+local headDead = {}
+local headTube = {}
+local headEgg = {}
+local moonProps = {}
+local tailCone = {}
+local fireProps = {}
+local ColorRemotes = {}
+
+local Seg = {}
+
+local HeadDir = Vector3.new(0, 0, 1)
+local smoothHeadDir = Vector3.new(0, 0, 1)
+
+local lastUpdate = 0
+local updateDelay = 2.0
+local fireWasHidden = false
+
+---------------------------------------------------
+-- ANTI-DELAY NETWORK: latest-wins, 1 invoke / remote
+-- Delay lama = antrian InvokeServer numpuk (lock di-clear tiap 0.5s).
+-- Sekarang posisi lama dibuang, hanya CFrame terbaru yang dikirim.
+---------------------------------------------------
+
+local pending = {}
+local sending = {}
+
+local function pushRemote(remote, payload)
+	if not remote then return end
+	pending[remote] = payload
+	if sending[remote] then return end
+	sending[remote] = true
+	task.spawn(function()
+		repeat
+			local data = pending[remote]
+			pending[remote] = nil
+			pcall(function()
+				remote:InvokeServer(data)
+			end)
+		until pending[remote] == nil
+		sending[remote] = false
+	end)
+end
+
+local function flushNetwork()
+	table.clear(pending)
+end
+
+---------------------------------------------------
+-- GRAPHICAL USER INTERFACE
+---------------------------------------------------
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "DragonSystemGui"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent = player:WaitForChild("PlayerGui")
+
+local UIScale = Instance.new("UIScale", ScreenGui)
+local function updateGuiScale()
+	local vp = camera.ViewportSize
+	UIScale.Scale = math.clamp(math.min(vp.X / 420, vp.Y / 780), 0.72, 1)
+end
+updateGuiScale()
+camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateGuiScale)
+
+local function applyCorner(gui, radius)
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, radius or 6)
+	corner.Parent = gui
+end
+
+local function applyStroke(gui, color, thickness)
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = color or Color3.fromRGB(60, 60, 70)
+	stroke.Thickness = thickness or 1
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	stroke.Parent = gui
+end
+
+local Main = Instance.new("Frame", ScreenGui)
+Main.Size = UDim2.new(0, 280, 0, 400)
+Main.Position = UDim2.new(0.5, -140, 0.5, -200)
+Main.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+Main.Active = true
+Main.Draggable = true
+applyCorner(Main, 10)
+applyStroke(Main, Color3.fromRGB(80, 80, 95), 1.5)
+
+local TopBar = Instance.new("Frame", Main)
+TopBar.Size = UDim2.new(1, 0, 0, 40)
+TopBar.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+applyCorner(TopBar, 10)
+
+local TopBarBottom = Instance.new("Frame", TopBar)
+TopBarBottom.Size = UDim2.new(1, 0, 0, 10)
+TopBarBottom.Position = UDim2.new(0, 0, 1, -10)
+TopBarBottom.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+TopBarBottom.BorderSizePixel = 0
+
+local Title = Instance.new("TextLabel", TopBar)
+Title.Size = UDim2.new(1, -80, 1, 0)
+Title.Position = UDim2.new(0, 15, 0, 0)
+Title.Text = "🐉 DRAGON SYSTEM"
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 14
+Title.BackgroundTransparency = 1
+Title.TextColor3 = Color3.fromRGB(240, 240, 240)
+Title.TextXAlignment = Enum.TextXAlignment.Left
+
+local Min = Instance.new("TextButton", TopBar)
+Min.Size = UDim2.new(0, 30, 0, 30)
+Min.Position = UDim2.new(1, -70, 0, 5)
+Min.Text = "-"
+Min.Font = Enum.Font.GothamBold
+Min.TextSize = 16
+Min.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+Min.TextColor3 = Color3.new(1, 1, 1)
+applyCorner(Min, 6)
+
+local Close = Instance.new("TextButton", TopBar)
+Close.Size = UDim2.new(0, 30, 0, 30)
+Close.Position = UDim2.new(1, -35, 0, 5)
+Close.Text = "X"
+Close.Font = Enum.Font.GothamBold
+Close.TextSize = 14
+Close.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+Close.TextColor3 = Color3.new(1, 1, 1)
+applyCorner(Close, 6)
+
+local Content = Instance.new("Frame", Main)
+Content.Size = UDim2.new(1, -30, 1, -55)
+Content.Position = UDim2.new(0, 15, 0, 50)
+Content.BackgroundTransparency = 1
+
+local UIListLayout = Instance.new("UIListLayout", Content)
+UIListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+UIListLayout.Padding = UDim.new(0, 12)
+
+local function createButton(text, order)
+	local btn = Instance.new("TextButton", Content)
+	btn.Size = UDim2.new(1, 0, 0, 40)
+	btn.Text = text
+	btn.Font = Enum.Font.GothamBold
+	btn.TextSize = 14
+	btn.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+	btn.TextColor3 = Color3.new(1, 1, 1)
+	btn.LayoutOrder = order
+	applyCorner(btn, 8)
+	applyStroke(btn, Color3.fromRGB(60, 60, 70), 1)
+	return btn
+end
+
+local Toggle = createButton("DRAGON: OFF", 1)
+local TpBtn = createButton("TELEPORT: OFF", 2)
+local CamBtn = createButton("CAM: OFF", 3)
+local ColorBtn = createButton("LOOP COLOR: OFF", 4)
+local FollowBtn = createButton("FOLLOW PLAYER: OFF", 5)
+
+local function createInputRow(labelText, defaultVal, order)
+	local row = Instance.new("Frame", Content)
+	row.Size = UDim2.new(1, 0, 0, 40)
+	row.BackgroundTransparency = 1
+	row.LayoutOrder = order
+
+	local label = Instance.new("TextLabel", row)
+	label.Size = UDim2.new(0.4, 0, 1, 0)
+	label.Text = labelText
+	label.Font = Enum.Font.GothamBold
+	label.TextSize = 13
+	label.TextColor3 = Color3.fromRGB(200, 200, 200)
+	label.BackgroundTransparency = 1
+	label.TextXAlignment = Enum.TextXAlignment.Left
+
+	local box = Instance.new("TextBox", row)
+	box.Size = UDim2.new(0.6, 0, 1, 0)
+	box.Position = UDim2.new(0.4, 0, 0, 0)
+	box.Text = tostring(defaultVal)
+	box.Font = Enum.Font.GothamBold
+	box.TextSize = 14
+	box.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+	box.TextColor3 = Color3.new(1, 1, 1)
+	applyCorner(box, 8)
+	applyStroke(box, Color3.fromRGB(60, 60, 70), 1)
+
+	return box, row
+end
+
+local SpeedBox = createInputRow("SPEED", baseSpeed, 6)
+
+local Bubble = Instance.new("TextButton", ScreenGui)
+Bubble.Size = UDim2.new(0, 56, 0, 56)
+Bubble.Position = UDim2.new(0, 16, 0.5, -28)
+Bubble.Text = "🐉"
+Bubble.TextSize = 24
+Bubble.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+Bubble.Visible = false
+Bubble.ZIndex = 10
+applyCorner(Bubble, 28)
+applyStroke(Bubble, Color3.fromRGB(200, 50, 50), 2)
+
+-- Tombol ATTACK hold — hanya muncul saat naga ON
+local AttackHold = Instance.new("TextButton", ScreenGui)
+AttackHold.Size = UDim2.new(0, 72, 0, 72)
+AttackHold.Position = UDim2.new(1, -168, 1, -96)
+AttackHold.Text = "ATK"
+AttackHold.Font = Enum.Font.GothamBold
+AttackHold.TextSize = 16
+AttackHold.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+AttackHold.TextColor3 = Color3.new(1, 1, 1)
+AttackHold.Visible = false
+AttackHold.ZIndex = 10
+AttackHold.AutoButtonColor = false
+applyCorner(AttackHold, 36)
+applyStroke(AttackHold, Color3.fromRGB(200, 80, 20), 2)
+
+local attackPointer = nil
+
+local function setAttackVisual(on)
+	AttackHold.BackgroundColor3 = on and Color3.fromRGB(200, 80, 20) or Color3.fromRGB(20, 20, 25)
+	AttackHold.Text = on and "ATK ON" or "ATK"
+end
+
+local function setAttack(on)
+	AttackEnabled = on
+	if not on then
+		attackPointer = nil
+		fireWasHidden = false
+	end
+	setAttackVisual(on)
+end
+
+local function setAttackHoldVisible()
+	AttackHold.Visible = Enabled
+	if not Enabled then
+		setAttack(false)
+	end
+end
+
+---------------------------------------------------
+-- GUI EVENT HANDLERS
+---------------------------------------------------
+
+SpeedBox.FocusLost:Connect(function()
+	local num = tonumber(SpeedBox.Text)
+	if num and num > 0 then
+		baseSpeed = math.clamp(num, 0.1, 10)
+	end
+	SpeedBox.Text = tostring(baseSpeed)
+end)
+
+Min.MouseButton1Click:Connect(function()
+	Main.Visible = false
+	Bubble.Visible = true
+end)
+
+Bubble.MouseButton1Click:Connect(function()
+	Main.Visible = true
+	Bubble.Visible = false
+end)
+
+Close.MouseButton1Click:Connect(function()
+	Enabled = false
+	setAttack(false)
+	flushNetwork()
+	setDragonCam(false)
+	pcall(function()
+		RunService:UnbindFromRenderStep("DragonControlSystem")
+	end)
+	if camPart then camPart:Destroy() end
+	ScreenGui:Destroy()
+end)
+
+AttackHold.InputBegan:Connect(function(input)
+	if input.UserInputType ~= Enum.UserInputType.Touch and input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+		return
+	end
+	attackPointer = input
+	setAttack(true)
+end)
+
+AttackHold.InputEnded:Connect(function(input)
+	if attackPointer == nil or input == attackPointer then
+		setAttack(false)
+	end
+end)
+
+UIS.InputEnded:Connect(function(input)
+	if attackPointer and input == attackPointer then
+		setAttack(false)
+	end
+end)
+
+---------------------------------------------------
+-- CHARACTER TELEPORT & DRAGON TOGGLE
+---------------------------------------------------
+
+local function enableTp()
+	TeleportEnabled = true
+	if humanoid then humanoid.PlatformStand = true end
+end
+
+local function disableTp()
+	TeleportEnabled = false
+	if humanoid then humanoid.PlatformStand = false end
+end
+
+local function toggleButtonVisual(btn, state, onText, offText, onColor)
+	btn.Text = state and onText or offText
+	if state then
+		TweenService:Create(btn, TweenInfo.new(0.3), {BackgroundColor3 = onColor or Color3.fromRGB(40, 150, 60)}):Play()
+	else
+		TweenService:Create(btn, TweenInfo.new(0.3), {BackgroundColor3 = Color3.fromRGB(40, 40, 45)}):Play()
+	end
+end
+
+TpBtn.MouseButton1Click:Connect(function()
+	if TeleportEnabled then
+		disableTp()
+		toggleButtonVisual(TpBtn, false, "TELEPORT: ON", "TELEPORT: OFF")
+	else
+		enableTp()
+		toggleButtonVisual(TpBtn, true, "TELEPORT: ON", "TELEPORT: OFF", Color3.fromRGB(40, 120, 180))
+	end
+end)
+
+CamBtn.MouseButton1Click:Connect(function()
+	setDragonCam(not CamEnabled)
+	toggleButtonVisual(CamBtn, CamEnabled, "CAM: ON", "CAM: OFF", Color3.fromRGB(40, 140, 200))
+end)
+
+Toggle.MouseButton1Click:Connect(function()
+	Enabled = not Enabled
+	toggleButtonVisual(Toggle, Enabled, "DRAGON: ON", "DRAGON: OFF", Color3.fromRGB(180, 50, 50))
+	setAttackHoldVisible()
+	if Enabled then
+		lastUpdate = 0
+		fireWasHidden = false
+		if CamEnabled then
+			applyDragonCam()
+		end
+	else
+		setAttack(false)
+		flushNetwork()
+		table.clear(Seg)
+		if CamEnabled then
+			restorePlayerCam()
+		end
+	end
+end)
+
+ColorBtn.MouseButton1Click:Connect(function()
+	LoopColorEnabled = not LoopColorEnabled
+	toggleButtonVisual(ColorBtn, LoopColorEnabled, "LOOP COLOR: ON", "LOOP COLOR: OFF", Color3.fromRGB(120, 30, 150))
+end)
+
+FollowBtn.MouseButton1Click:Connect(function()
+	FollowPlayerEnabled = not FollowPlayerEnabled
+	toggleButtonVisual(FollowBtn, FollowPlayerEnabled, "FOLLOW PLAYER: ON", "FOLLOW PLAYER: OFF", Color3.fromRGB(180, 120, 30))
+end)
+
+---------------------------------------------------
+-- STRUCTURAL PROP ACQUISITION
+---------------------------------------------------
+
+local function updateProps()
+	table.clear(Props)
+	table.clear(headDead)
+	table.clear(headTube)
+	table.clear(headEgg)
+	table.clear(moonProps)
+	table.clear(tailCone)
+	table.clear(fireProps)
+	table.clear(ColorRemotes)
+
+	local folder = workspace:FindFirstChild("WorkspaceCom")
+	if not folder then return end
+
+	local cone = folder:FindFirstChild("001_TrafficCones")
+	if not cone then return end
+
+	local pname = player.Name
+	local propName = "Prop" .. pname
+
+	for _, v in ipairs(cone:GetChildren()) do
+		local n = v.Name
+		if n == propName or string.find(n, pname, 1, true) then
+			local remote = v:FindFirstChild("SetCurrentCFrame")
+			local id = v:GetAttribute("id")
+			if remote and id then
+				if id == "DeadGraveBlood" then
+					table.insert(headDead, remote)
+					local colorRemote = v:FindFirstChild("ChangePropColor")
+					if colorRemote then table.insert(ColorRemotes, colorRemote) end
+				elseif id == "TubeLamp" then
+					table.insert(headTube, remote)
+				elseif id == "EggLamp" then
+					table.insert(headEgg, remote)
+				elseif id == "Cylinder" then
+					table.insert(Props, remote)
+					local colorRemote = v:FindFirstChild("ChangePropColor")
+					if colorRemote then table.insert(ColorRemotes, colorRemote) end
+				elseif id == "GirlyShapeMoon" then
+					table.insert(moonProps, remote)
+				elseif id == "Cone" then
+					table.insert(tailCone, remote)
+				elseif id == "LightsSpotLightRed" then
+					table.insert(fireProps, remote)
+				end
+			end
+		end
+	end
+end
+
+---------------------------------------------------
+-- COLOR LOOP
+---------------------------------------------------
+task.spawn(function()
+	local colors = { Color3.fromRGB(120, 0, 0), Color3.fromRGB(0, 0, 0) }
+	local colorIndex = 1
+
+	while true do
+		if LoopColorEnabled and Enabled and #ColorRemotes > 0 then
+			local targetColor = colors[colorIndex]
+			for _, colorRem in ipairs(ColorRemotes) do
+				pushRemote(colorRem, targetColor)
+			end
+			colorIndex = colorIndex == 1 and 2 or 1
+		end
+		task.wait(0.5)
+	end
+end)
+
+---------------------------------------------------
+-- JOYSTICK / WASD → ARAH TERBANG 3D
+---------------------------------------------------
+
+local function getJoystickFlyDir(camCF, move)
+	if move.Magnitude < 0.05 then
+		return nil
+	end
+
+	local lookFlat = Vector3.new(camCF.LookVector.X, 0, camCF.LookVector.Z)
+	local rightFlat = Vector3.new(camCF.RightVector.X, 0, camCF.RightVector.Z)
+
+	local fwdInput = 0
+	local rightInput = 0
+	if lookFlat.Magnitude > 0.001 then
+		fwdInput = move:Dot(lookFlat.Unit)
+	end
+	if rightFlat.Magnitude > 0.001 then
+		rightInput = move:Dot(rightFlat.Unit)
+	end
+
+	local dir = (camCF.LookVector * fwdInput) + (camCF.RightVector * rightInput)
+	if dir.Magnitude < 0.001 then
+		return nil
+	end
+	return dir.Unit
+end
+
+---------------------------------------------------
+-- MAIN KINEMATIC LOOP
+---------------------------------------------------
+
+RunService:BindToRenderStep("DragonControlSystem", 199, function()
+	if not Enabled then return end
+
+	if tick() - lastUpdate > updateDelay then
+		updateProps()
+		lastUpdate = tick()
+	end
+
+	if #Props == 0 and #headDead == 0 then return end
+
+	local camCF = camera.CFrame
+
+	if FollowPlayerEnabled and hrp then
+		HeadDir = hrp.CFrame.LookVector
+		local targetPos = (hrp.CFrame * CFrame.new(0, 10, 3)).Position
+		dragonPos = dragonPos:Lerp(targetPos, 0.2)
+	else
+		local move = humanoid and humanoid.MoveDirection or Vector3.zero
+		local flyDir = getJoystickFlyDir(camCF, move)
+		if flyDir then
+			HeadDir = flyDir
+			dragonPos += flyDir * baseSpeed * math.min(move.Magnitude, 1)
+		end
+	end
+
+	smoothHeadDir = smoothHeadDir:Lerp(HeadDir, headTurnSpeed)
+	if smoothHeadDir.Magnitude > 0.001 then
+		smoothHeadDir = smoothHeadDir.Unit
+	end
+	Seg[1] = Seg[1] and Seg[1]:Lerp(dragonPos, 0.35) or dragonPos
+
+	local totalSegments = #Props + 1
+	for i = 2, totalSegments do
+		local prev = Seg[i - 1]
+		local cur = Seg[i] or prev
+		local currentDistance = (i == 2) and (TAIL_SEGMENT_DISTANCE + 2) or TAIL_SEGMENT_DISTANCE
+
+		local d
+		if i == 2 then
+			d = smoothHeadDir
+		else
+			d = (prev - cur)
+			d = (d.Magnitude > 0.001) and d.Unit or smoothHeadDir
+		end
+
+		local target = prev - (d * currentDistance)
+		local newPos = cur:Lerp(target, tailSmoothness)
+
+		local constraintDelta = prev - newPos
+		if constraintDelta.Magnitude > currentDistance then
+			newPos = prev - (constraintDelta.Unit * currentDistance)
+		end
+
+		Seg[i] = newPos
+	end
+
+	-- NETWORK: overwrite pending setiap frame, worker kirim yang terbaru
+	local headBase = CFrame.lookAt(Seg[1], Seg[1] + smoothHeadDir) * CFrame.Angles(0, math.rad(180), 0)
+
+	local jawCF = AttackEnabled
+		and (headBase * CFrame.new(0, -2.5, -0.5) * CFrame.Angles(math.rad(115), 0, 0))
+		or (headBase * CFrame.new(0, -2.5, 0) * CFrame.Angles(math.rad(90), 0, 0))
+
+	local cfa1 = headBase * CFrame.new(0, 2.5, -2.5) * CFrame.Angles(math.rad(100), 0, 0)
+	local cfa2 = headBase * CFrame.new(0, 0, 0) * CFrame.Angles(math.rad(90), 0, 0)
+	local cfa3 = headBase * CFrame.new(0, -4.5, -1.15)
+
+	if headDead[1] then pushRemote(headDead[1], cfa1) end
+	if headDead[2] then pushRemote(headDead[2], cfa2) end
+	if headDead[3] then pushRemote(headDead[3], cfa3) end
+	if headDead[4] then pushRemote(headDead[4], jawCF) end
+
+	if headEgg[1] then pushRemote(headEgg[1], cfa2 * CFrame.new(1.20000005, 1.2, -1.2)) end
+	if headEgg[2] then pushRemote(headEgg[2], cfa2 * CFrame.new(-1.39999998, 1.2, -1.2)) end
+
+	if headTube[1] then
+		pushRemote(headTube[1], cfa2 * CFrame.new(-1, -1.5, -3) * CFrame.Angles(math.rad(210), 0, math.rad(30)))
+	end
+	if headTube[2] then
+		pushRemote(headTube[2], cfa2 * CFrame.new(1, -1.5, -3) * CFrame.Angles(math.rad(210), 0, math.rad(-30)))
+	end
+
+	if AttackEnabled then
+		fireWasHidden = false
+		local spinAngle = tick() * 60
+		for i, fireRemote in ipairs(fireProps) do
+			local ang = (i % 2 == 0) and -spinAngle or spinAngle
+			pushRemote(fireRemote, headBase * CFrame.new(0, -1, -1) * CFrame.Angles(math.rad(105), 0, 0) * CFrame.Angles(0, ang, 0))
+		end
+	elseif not fireWasHidden then
+		fireWasHidden = true
+		local hiddenCF = CFrame.new(0, -40, 0)
+		for _, fireRemote in ipairs(fireProps) do
+			pushRemote(fireRemote, hiddenCF)
+		end
+	end
+
+	for i, v in ipairs(Props) do
+		local pos = Seg[i + 1]
+		local nextPos = Seg[i] or pos
+		if pos then
+			local dir = (nextPos - pos)
+			if dir.Magnitude > 0.001 then
+				dir = dir.Unit
+				pushRemote(v, CFrame.lookAt(pos, pos + dir) * CFrame.Angles(math.rad(-90), 0, 0))
+				if moonProps[i] then
+					pushRemote(
+						moonProps[i],
+						CFrame.lookAt(pos + Vector3.new(0, 1, 0), pos + dir + Vector3.new(0, 1, 0))
+							* CFrame.Angles(math.rad(30), math.rad(-90), 0)
+							* CFrame.new(-3, -2, 0)
+					)
+				end
+			end
+		end
+	end
+
+	if tailCone[1] and #Seg > 1 and Seg[#Seg] then
+		local pos = Seg[#Seg]
+		local lastSegmentDir = (Seg[#Seg] - Seg[#Seg - 1])
+		if lastSegmentDir.Magnitude > 0.001 then
+			pushRemote(tailCone[1], CFrame.lookAt(pos, pos + lastSegmentDir.Unit) * CFrame.Angles(math.rad(-90), 0, 0))
+		end
+	end
+
+	if TeleportEnabled and hrp then
+		local head = Seg[1] or dragonPos
+		hrp.CFrame = CFrame.lookAt(head + Vector3.new(0, 3, 0), head + (smoothHeadDir * 10))
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		hrp.AssemblyAngularVelocity = Vector3.zero
+	end
+
+	if CamEnabled and camPart then
+		local head = Seg[1] or dragonPos
+		local dir = (smoothHeadDir.Magnitude > 0.001) and smoothHeadDir.Unit or Vector3.new(0, 0, 1)
+		camPart.CFrame = CFrame.lookAt(head + Vector3.new(0, 2.5, 0), head + Vector3.new(0, 2.5, 0) + dir)
+		if camera.CameraSubject ~= camPart then
+			applyDragonCam()
+		end
+	end
+end)
+      
