@@ -1,6 +1,14 @@
 -- ==============================================================================
--- DRAGON CONTROL SCRIPT - SMOOTH + LASER FORWARD
+-- DRAGON CONTROL SCRIPT V2 - SPAWN FIX + SMOOTH + COLOR WHEEL
 -- BY | HANZ
+-- ==============================================================================
+-- MODEL NAGA (yang dibayangkan):
+--   Seg[1]  = kepala (paling depan)
+--   Seg[2..] = badan, tiap segmen mengikuti segmen di depannya (follow-the-leader)
+--   Seg[n]  = ujung ekor (kerucut)
+--   Tiap bagian punya 2 arah: LOOK (menghadap ke depan/ke kepala) dan UP (punggung).
+--   UP dibawa terus dari kepala sampai ekor (parallel transport), jadi tidak
+--   pernah "flip" waktu naga tegak lurus (ini penyebab badan kebalik di versi lama).
 -- ==============================================================================
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -9,6 +17,18 @@ local TweenService = game:GetService("TweenService")
 
 local player = Players.LocalPlayer
 local camera = workspace.CurrentCamera
+
+-- bersihkan sisa script lama kalau di-execute 2x
+pcall(function()
+    RunService:UnbindFromRenderStep("DragonControlSystem")
+end)
+do
+    local pg = player:WaitForChild("PlayerGui")
+    local oldGui = pg:FindFirstChild("DragonSystemGui")
+    if oldGui then oldGui:Destroy() end
+    local oldCam = camera:FindFirstChild("DragonHeadCam")
+    if oldCam then oldCam:Destroy() end
+end
 
 local camPart = Instance.new("Part")
 camPart.Name = "DragonHeadCam"
@@ -25,6 +45,15 @@ camPart.Parent = camera
 ---------------------------------------------------
 -- STATE
 ---------------------------------------------------
+local alive = true
+local conns = {}
+local function track(conn)
+    table.insert(conns, conn)
+    return conn
+end
+
+local WORLD_UP = Vector3.new(0, 1, 0)
+
 local Enabled = false
 local TeleportEnabled = false
 local CamEnabled = false
@@ -42,8 +71,11 @@ local spawnAnimStartPos, spawnAnimEndPos
 local spawnAnimStartDir, spawnAnimEndDir
 local spawnAnimSpiralAngle = 0
 
-local CustomColorEnabled = false
-local CustomColorValue = Color3.fromRGB(0, 100, 255)
+-- WARNA
+local ColorMode = "OFF" -- OFF | SOLID | RAINBOW | FLOW
+local pickH, pickS, pickV = 0.6, 1, 1
+local TargetBody, TargetAccent = true, true
+local colorDirty = false
 
 local PROP_ID_SEAT = "FloorCushion"
 local SEAT_OFFSET = CFrame.new(0, 0, 0)
@@ -51,10 +83,9 @@ local SEAT_OFFSET = CFrame.new(0, 0, 0)
 local LASER_SPIN_SPEED = 1440
 local LASER_OFFSET = CFrame.new(0, -1, -1)
 local laserSpinAngle = 0
-
 local LASER_PART_FIX = CFrame.Angles(-math.pi / 2, 0, 0)
 
-local MAX_PITCH_Y = 0.9
+local MAX_PITCH_Y = 0.9 -- hanya dipakai untuk teleport & kamera
 
 local character, humanoid, hrp
 
@@ -85,72 +116,112 @@ character = player.Character or player.CharacterAdded:Wait()
 humanoid = character:WaitForChild("Humanoid")
 hrp = character:WaitForChild("HumanoidRootPart")
 
-player.CharacterAdded:Connect(function(char)
+track(player.CharacterAdded:Connect(function(char)
     character = char
     humanoid = char:WaitForChild("Humanoid")
     hrp = char:WaitForChild("HumanoidRootPart")
     if CamEnabled and Enabled then
         task.defer(applyDragonCam)
     end
-end)
+end))
 
-local baseSpeed = 0.8
+local baseSpeed = 0.8            -- satuan lama: stud per frame @60fps (sekarang sudah dikali dt)
 local TAIL_SEGMENT_DISTANCE = 6.0
 local tailSmoothness = 0.22
 local headTurnSpeed = 0.15
 
 local dragonPos = hrp.Position + Vector3.new(0, 8, 0)
 
-local Props = {}
-local headDead = {}
-local headTube = {}
-local headEgg = {}
-local moonProps = {}
-local tailCone = {}
-local fireProps = {}
-local ColorRemotes = {}
-local customColorRemotes = {}
-local headSeat = {}
+-- daftar prop per kategori (isi diubah in-place, jangan di-assign ulang)
+local Cat = {
+    body = {}, dead = {}, tube = {}, egg = {},
+    moon = {}, cone = {}, fire = {}, seat = {},
+}
+local Props, headDead, headTube, headEgg = Cat.body, Cat.dead, Cat.tube, Cat.egg
+local moonProps, tailCone, fireProps, headSeat = Cat.moon, Cat.cone, Cat.fire, Cat.seat
+local colorOf = {}   -- remote SetCurrentCFrame -> remote ChangePropColor
+local knownProp = {} -- remote SetCurrentCFrame -> nama kategori
+
+local CAT_BY_ID = {
+    DeadGraveBlood = "dead",
+    TubeLamp = "tube",
+    EggLamp = "egg",
+    Cylinder = "body",
+    GirlyShapeMoon = "moon",
+    Cone = "cone",
+    LightsSpotLightRed = "fire",
+}
+CAT_BY_ID[PROP_ID_SEAT] = "seat"
 
 local Seg = {}
+local BodyUp = {}
 
 local HeadDir = Vector3.new(0, 0, 1)
 local smoothHeadDir = Vector3.new(0, 0, 1)
+local HeadUp = WORLD_UP
+local jawOpen = 0
 
 local lastUpdate = 0
 local updateDelay = 2.0
 local fireWasHidden = false
 
 ---------------------------------------------------
--- NETWORK
+-- NETWORK (dikirim serempak 1 batch, biar badan tidak "patah" antar-bagian)
 ---------------------------------------------------
 local pending = {}
-local sending = {}
+local inflight = 0
+local netGen = 0
+local lastDispatch = 0
+local netConn
+local SEND_INTERVAL = 1 / 30 -- batas kirim tercepat (detik)
+local NET_TIMEOUT = 0.75     -- kalau server lambat, jangan nunggu selamanya
 
 local function pushRemote(remote, payload)
-    if not remote then return end
-    pending[remote] = payload
-    if sending[remote] then return end
-    sending[remote] = true
-    task.spawn(function()
-        repeat
-            local data = pending[remote]
-            pending[remote] = nil
-            pcall(function()
-                remote:InvokeServer(data)
-            end)
-        until pending[remote] == nil
-        sending[remote] = false
-    end)
+    if remote then
+        pending[remote] = payload
+    end
 end
 
 local function flushNetwork()
-    table.clear(pending)
+    pending = {}
 end
+
+local function dispatchBatch()
+    local batch = pending
+    if next(batch) == nil then return end
+    pending = {}
+    netGen += 1
+    local myGen = netGen
+    inflight = 0
+    lastDispatch = os.clock()
+    for remote, data in pairs(batch) do
+        inflight += 1
+        task.spawn(function()
+            pcall(function()
+                remote:InvokeServer(data)
+            end)
+            if myGen == netGen then
+                inflight -= 1
+            end
+        end)
+    end
+end
+
+netConn = RunService.Heartbeat:Connect(function()
+    local now = os.clock()
+    if now - lastDispatch < SEND_INTERVAL then return end
+    if inflight > 0 and now - lastDispatch < NET_TIMEOUT then return end
+    dispatchBatch()
+end)
 
 ---------------------------------------------------
 -- PRECISION HELPERS
 ---------------------------------------------------
+-- smoothing yang tidak tergantung FPS (k = faktor per frame @60fps)
+local function alphaDt(k, dt)
+    return 1 - (1 - k) ^ (dt * 60)
+end
+
 local function clampDirection(dir)
     if dir.Magnitude < 0.001 then
         return Vector3.new(0, 0, 1)
@@ -167,25 +238,6 @@ local function clampDirection(dir)
     local newY = (dir.Y > 0) and MAX_PITCH_Y or -MAX_PITCH_Y
     local hMag = math.sqrt(1 - newY * newY)
     return (horiz * hMag + Vector3.new(0, newY, 0)).Unit
-end
-
-local function stableLookAt(pos, dir)
-    local mag = dir.Magnitude
-    if mag < 0.001 then
-        return CFrame.new(pos)
-    end
-    dir = dir / mag
-    local up = Vector3.new(0, 1, 0)
-    if math.abs(dir.Y) > 0.9 then
-        up = Vector3.new(1, 0, 0)
-    end
-    return CFrame.lookAt(pos, pos + dir, up)
-end
-
-local function computeHeadBase(pos, rawDir)
-    local dir = clampDirection(rawDir)
-    local base = stableLookAt(pos, dir)
-    return base * CFrame.Angles(0, math.rad(180), 0)
 end
 
 local function slerpDir(a, b, t)
@@ -205,6 +257,59 @@ local function slerpDir(a, b, t)
     return (a * math.cos(theta) + rel * math.sin(theta)).Unit
 end
 
+-- proyeksikan "atas" ke bidang tegak lurus arah (selalu valid, tidak pernah flip)
+local function projectUp(up, dir, fallback)
+    local u = up - dir * up:Dot(dir)
+    if u.Magnitude < 1e-3 and fallback then
+        u = fallback - dir * fallback:Dot(dir)
+    end
+    if u.Magnitude < 1e-3 then
+        u = WORLD_UP - dir * dir.Y
+        if u.Magnitude < 1e-3 then
+            u = Vector3.new(1, 0, 0) - dir * dir.X
+        end
+    end
+    return u.Unit
+end
+
+-- CFrame dari posisi + arah hadap (look) + atas (up). -Z = look, seperti CFrame.lookAt
+local function makeFrame(pos, look, up)
+    local right = look:Cross(up)
+    if right.Magnitude < 1e-4 then
+        right = look:Cross(projectUp(up, look))
+    end
+    right = right.Unit
+    local trueUp = right:Cross(look)
+    return CFrame.fromMatrix(pos, right, trueUp, -look)
+end
+
+local function updateHeadUp(dt)
+    local d = smoothHeadDir
+    local u = projectUp(HeadUp, d)
+    -- tarik pelan ke "atas dunia" supaya tidak miring terus; makin tegak makin lemah
+    local wu = WORLD_UP - d * d.Y
+    local w = wu.Magnitude
+    if w > 0.05 then
+        local pull = alphaDt(0.1 * math.min(w, 1), dt)
+        u = projectUp(slerpDir(u, wu.Unit, pull), d, u)
+    end
+    HeadUp = u
+end
+
+local function segGap(i)
+    return (i == 2) and (TAIL_SEGMENT_DISTANCE + 2) or TAIL_SEGMENT_DISTANCE
+end
+
+-- badan dibentangkan lurus di belakang kepala (tidak numpuk di 1 titik)
+local function layStraight(pos, dir)
+    table.clear(Seg)
+    table.clear(BodyUp)
+    Seg[1] = pos
+    for i = 2, #Props + 1 do
+        Seg[i] = Seg[i - 1] - dir * segGap(i)
+    end
+end
+
 ---------------------------------------------------
 -- GUI
 ---------------------------------------------------
@@ -221,7 +326,7 @@ local function updateGuiScale()
     UIScale.Scale = math.clamp(math.min(vp.X / 360, vp.Y / 620), 0.72, 1)
 end
 updateGuiScale()
-camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateGuiScale)
+track(camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateGuiScale))
 
 local function applyCorner(gui, radius)
     local corner = Instance.new("UICorner")
@@ -315,14 +420,20 @@ local TabSpawn = createTabButton("SPAWN", 2)
 local TabWarna = createTabButton("WARNA", 3)
 
 local function createTabFrame()
-    local f = Instance.new("Frame", Main)
+    local f = Instance.new("ScrollingFrame", Main)
     f.Size = UDim2.new(1, -20, 1, -86)
     f.Position = UDim2.new(0, 10, 0, 80)
     f.BackgroundTransparency = 1
+    f.BorderSizePixel = 0
+    f.ScrollBarThickness = 3
+    f.ScrollingDirection = Enum.ScrollingDirection.Y
+    f.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    f.CanvasSize = UDim2.new(0, 0, 0, 0)
     f.Visible = false
     local layout = Instance.new("UIListLayout", f)
     layout.SortOrder = Enum.SortOrder.LayoutOrder
     layout.Padding = UDim.new(0, 8)
+    layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
     return f
 end
 
@@ -345,7 +456,7 @@ TabWarna.MouseButton1Click:Connect(function() selectTab(3) end)
 
 local function createButton(parent, text, order)
     local btn = Instance.new("TextButton", parent)
-    btn.Size = UDim2.new(1, 0, 0, 38)
+    btn.Size = UDim2.new(1, -6, 0, 38)
     btn.Text = text
     btn.Font = Enum.Font.GothamBold
     btn.TextSize = 13
@@ -359,7 +470,7 @@ end
 
 local function createInputRow(parent, labelText, defaultVal, order)
     local row = Instance.new("Frame", parent)
-    row.Size = UDim2.new(1, 0, 0, 36)
+    row.Size = UDim2.new(1, -6, 0, 36)
     row.BackgroundTransparency = 1
     row.LayoutOrder = order
 
@@ -398,7 +509,7 @@ local SpawnAnimBtn = createButton(SpawnTab, "SPAWN ANIM: ON", 1)
 local SpawnTypeBtn = createButton(SpawnTab, "TYPE: RISE UP", 2)
 local SpawnDurBox = createInputRow(SpawnTab, "DURATION", SpawnAnimDuration, 3)
 local SpawnHelp = Instance.new("TextLabel", SpawnTab)
-SpawnHelp.Size = UDim2.new(1, 0, 0, 60)
+SpawnHelp.Size = UDim2.new(1, -6, 0, 70)
 SpawnHelp.BackgroundTransparency = 1
 SpawnHelp.TextColor3 = Color3.fromRGB(160, 160, 170)
 SpawnHelp.Font = Enum.Font.Gotham
@@ -409,62 +520,221 @@ SpawnHelp.TextYAlignment = Enum.TextYAlignment.Top
 SpawnHelp.LayoutOrder = 4
 SpawnHelp.Text = "TYPE:\n• RISE UP: keluar dari bawah tanah, kepala hadap atas lalu tegak hadap depan\n• SPIRAL: naik sambil berputar spiral\n• DROP: turun dari atas langit"
 
+-- ===================== TAB WARNA =====================
 local WarnaHeader = Instance.new("TextLabel", WarnaTab)
-WarnaHeader.Size = UDim2.new(1, 0, 0, 34)
+WarnaHeader.Size = UDim2.new(1, -6, 0, 30)
 WarnaHeader.BackgroundTransparency = 1
-WarnaHeader.TextColor3 = Color3.fromRGB(220, 220, 220)
+WarnaHeader.TextColor3 = Color3.fromRGB(200, 200, 210)
 WarnaHeader.Font = Enum.Font.GothamBold
-WarnaHeader.TextSize = 11
+WarnaHeader.TextSize = 10
 WarnaHeader.TextWrapped = true
 WarnaHeader.TextXAlignment = Enum.TextXAlignment.Left
+WarnaHeader.TextYAlignment = Enum.TextYAlignment.Top
 WarnaHeader.LayoutOrder = 1
-WarnaHeader.Text = "Warna khusus untuk: GirlyShapeMoon • EggLamp • TubeLamp"
+WarnaHeader.Text = "Tap warna di roda, geser TERANG. BADAN = kepala + badan. AKSEN = Moon, Egg, Tube."
 
-local colorGrid = Instance.new("Frame", WarnaTab)
-colorGrid.Size = UDim2.new(1, 0, 0, 130)
-colorGrid.BackgroundTransparency = 1
-colorGrid.LayoutOrder = 2
+local WHEEL_SIZE = 176
+local WHEEL_C = WHEEL_SIZE / 2
+local WHEEL_MAX_R = 78
 
-local colorGridLayout = Instance.new("UIGridLayout", colorGrid)
-colorGridLayout.CellSize = UDim2.new(0.24, -4, 0, 30)
-colorGridLayout.CellPadding = UDim2.new(0.01, 2, 0, 4)
-colorGridLayout.SortOrder = Enum.SortOrder.LayoutOrder
+local WheelHolder = Instance.new("Frame", WarnaTab)
+WheelHolder.Size = UDim2.new(0, WHEEL_SIZE, 0, WHEEL_SIZE)
+WheelHolder.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
+WheelHolder.LayoutOrder = 2
+applyCorner(WheelHolder, WHEEL_SIZE / 2)
+applyStroke(WheelHolder, Color3.fromRGB(70, 70, 85), 1)
 
-local colorPresets = {
-    {name = "BIRU",   color = Color3.fromRGB(0, 100, 255)},
-    {name = "MERAH",  color = Color3.fromRGB(255, 30, 30)},
-    {name = "HIJAU",  color = Color3.fromRGB(30, 255, 80)},
-    {name = "UNGU",   color = Color3.fromRGB(150, 30, 255)},
-    {name = "KUNING", color = Color3.fromRGB(255, 230, 30)},
-    {name = "PUTIH",  color = Color3.fromRGB(255, 255, 255)},
-    {name = "PINK",   color = Color3.fromRGB(255, 100, 180)},
-    {name = "HITAM",  color = Color3.fromRGB(20, 20, 20)},
-}
+local pickWheel -- diisi nanti (forward declaration)
 
-local colorButtons = {}
-for i, preset in ipairs(colorPresets) do
-    local btn = Instance.new("TextButton", colorGrid)
-    btn.Text = preset.name
-    btn.Font = Enum.Font.GothamBold
-    btn.TextSize = 10
-    btn.BackgroundColor3 = preset.color
-    btn.TextColor3 = (preset.name == "PUTIH" or preset.name == "KUNING") and Color3.new(0,0,0) or Color3.new(1,1,1)
-    btn.LayoutOrder = i
-    applyCorner(btn, 6)
-    applyStroke(btn, Color3.fromRGB(60, 60, 70), 1)
-    colorButtons[i] = btn
+local function makeWheelDot(h, s, radius, angle, size)
+    local dot = Instance.new("TextButton")
+    dot.Size = UDim2.new(0, size, 0, size)
+    dot.Position = UDim2.new(
+        0, WHEEL_C + math.cos(angle) * radius - size / 2,
+        0, WHEEL_C - math.sin(angle) * radius - size / 2
+    )
+    dot.Text = ""
+    dot.AutoButtonColor = false
+    dot.BorderSizePixel = 0
+    dot.BackgroundColor3 = Color3.fromHSV(h, s, 1)
+    dot.Parent = WheelHolder
+    applyCorner(dot, size / 2)
+    dot.MouseButton1Click:Connect(function()
+        pickWheel(h, s)
+    end)
 end
 
-local CustomColorOffBtn = createButton(WarnaTab, "MATIKAN WARNA CUSTOM", 3)
+local WHEEL_RINGS = {
+    { r = 20, n = 8 },
+    { r = 40, n = 16 },
+    { r = 60, n = 24 },
+    { r = 78, n = 32 },
+}
+makeWheelDot(0, 0, 0, 0, 20) -- tengah = putih
+for _, ring in ipairs(WHEEL_RINGS) do
+    for j = 0, ring.n - 1 do
+        local h = j / ring.n
+        makeWheelDot(h, ring.r / WHEEL_MAX_R, ring.r, h * math.pi * 2, 17)
+    end
+end
+
+local WheelMarker = Instance.new("Frame", WheelHolder)
+WheelMarker.Size = UDim2.new(0, 24, 0, 24)
+WheelMarker.BackgroundTransparency = 1
+WheelMarker.ZIndex = 5
+applyCorner(WheelMarker, 12)
+applyStroke(WheelMarker, Color3.new(1, 1, 1), 2)
+
+-- slider TERANG
+local BrightRow = Instance.new("Frame", WarnaTab)
+BrightRow.Size = UDim2.new(1, -6, 0, 30)
+BrightRow.BackgroundTransparency = 1
+BrightRow.LayoutOrder = 3
+
+local BrightLabel = Instance.new("TextLabel", BrightRow)
+BrightLabel.Size = UDim2.new(0.28, 0, 1, 0)
+BrightLabel.BackgroundTransparency = 1
+BrightLabel.Text = "TERANG"
+BrightLabel.Font = Enum.Font.GothamBold
+BrightLabel.TextSize = 12
+BrightLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+BrightLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local BrightTrack = Instance.new("TextButton", BrightRow)
+BrightTrack.Size = UDim2.new(0.68, 0, 0, 16)
+BrightTrack.Position = UDim2.new(0.3, 0, 0.5, -8)
+BrightTrack.Text = ""
+BrightTrack.AutoButtonColor = false
+BrightTrack.BackgroundColor3 = Color3.new(1, 1, 1)
+BrightTrack.BorderSizePixel = 0
+applyCorner(BrightTrack, 8)
+applyStroke(BrightTrack, Color3.fromRGB(70, 70, 85), 1)
+
+local BrightGrad = Instance.new("UIGradient", BrightTrack)
+BrightGrad.Color = ColorSequence.new(Color3.new(0, 0, 0), Color3.new(1, 1, 1))
+
+local BrightKnob = Instance.new("Frame", BrightTrack)
+BrightKnob.Size = UDim2.new(0, 10, 0, 24)
+BrightKnob.AnchorPoint = Vector2.new(0.5, 0.5)
+BrightKnob.Position = UDim2.new(pickV, 0, 0.5, 0)
+BrightKnob.BackgroundColor3 = Color3.new(1, 1, 1)
+BrightKnob.ZIndex = 3
+applyCorner(BrightKnob, 4)
+applyStroke(BrightKnob, Color3.fromRGB(20, 20, 25), 1.5)
+
+-- preview
+local PreviewRow = Instance.new("Frame", WarnaTab)
+PreviewRow.Size = UDim2.new(1, -6, 0, 30)
+PreviewRow.BackgroundTransparency = 1
+PreviewRow.LayoutOrder = 4
+
+local PreviewSwatch = Instance.new("Frame", PreviewRow)
+PreviewSwatch.Size = UDim2.new(0, 56, 0, 26)
+PreviewSwatch.Position = UDim2.new(0, 0, 0.5, -13)
+applyCorner(PreviewSwatch, 6)
+applyStroke(PreviewSwatch, Color3.fromRGB(90, 90, 105), 1)
+
+local PreviewText = Instance.new("TextLabel", PreviewRow)
+PreviewText.Size = UDim2.new(1, -66, 1, 0)
+PreviewText.Position = UDim2.new(0, 66, 0, 0)
+PreviewText.BackgroundTransparency = 1
+PreviewText.Font = Enum.Font.GothamBold
+PreviewText.TextSize = 12
+PreviewText.TextColor3 = Color3.fromRGB(220, 220, 220)
+PreviewText.TextXAlignment = Enum.TextXAlignment.Left
+PreviewText.Text = ""
+
+local function createRow(parent, height, order)
+    local row = Instance.new("Frame", parent)
+    row.Size = UDim2.new(1, -6, 0, height)
+    row.BackgroundTransparency = 1
+    row.LayoutOrder = order
+    local l = Instance.new("UIListLayout", row)
+    l.FillDirection = Enum.FillDirection.Horizontal
+    l.Padding = UDim.new(0, 6)
+    l.SortOrder = Enum.SortOrder.LayoutOrder
+    return row
+end
+
+local function createRowButton(row, text, size, order)
+    local btn = Instance.new("TextButton", row)
+    btn.Size = size
+    btn.Text = text
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 11
+    btn.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+    btn.TextColor3 = Color3.new(1, 1, 1)
+    btn.LayoutOrder = order
+    applyCorner(btn, 7)
+    applyStroke(btn, Color3.fromRGB(60, 60, 70), 1)
+    return btn
+end
+
+local GREEN = Color3.fromRGB(40, 140, 90)
+local IDLE = Color3.fromRGB(40, 40, 45)
+
+local TargetRow = createRow(WarnaTab, 34, 5)
+local TgtBodyBtn = createRowButton(TargetRow, "BADAN: ON", UDim2.new(0.5, -3, 1, 0), 1)
+local TgtAccentBtn = createRowButton(TargetRow, "AKSEN: ON", UDim2.new(0.5, -3, 1, 0), 2)
+TgtBodyBtn.BackgroundColor3 = GREEN
+TgtAccentBtn.BackgroundColor3 = GREEN
+
+local ModeRow = createRow(WarnaTab, 34, 6)
+local modeButtons = {
+    SOLID = createRowButton(ModeRow, "SOLID", UDim2.new(0.25, -4.5, 1, 0), 1),
+    RAINBOW = createRowButton(ModeRow, "PELANGI", UDim2.new(0.25, -4.5, 1, 0), 2),
+    FLOW = createRowButton(ModeRow, "MENGALIR", UDim2.new(0.25, -4.5, 1, 0), 3),
+    OFF = createRowButton(ModeRow, "OFF", UDim2.new(0.25, -4.5, 1, 0), 4),
+}
+for _, b in pairs(modeButtons) do
+    b.TextSize = 10
+end
+
+local colorPresets = {
+    Color3.fromRGB(0, 100, 255),   -- biru
+    Color3.fromRGB(255, 30, 30),   -- merah
+    Color3.fromRGB(30, 255, 80),   -- hijau
+    Color3.fromRGB(150, 30, 255),  -- ungu
+    Color3.fromRGB(255, 230, 30),  -- kuning
+    Color3.fromRGB(255, 255, 255), -- putih
+    Color3.fromRGB(255, 100, 180), -- pink
+    Color3.fromRGB(20, 20, 20),    -- hitam
+    Color3.fromRGB(255, 140, 20),  -- oranye
+    Color3.fromRGB(0, 230, 255),   -- cyan
+    Color3.fromRGB(170, 255, 0),   -- lime
+    Color3.fromRGB(255, 0, 200),   -- magenta
+}
+
+local PresetGrid = Instance.new("Frame", WarnaTab)
+PresetGrid.Size = UDim2.new(1, -6, 0, 58)
+PresetGrid.BackgroundTransparency = 1
+PresetGrid.LayoutOrder = 7
+local PresetLayout = Instance.new("UIGridLayout", PresetGrid)
+PresetLayout.CellSize = UDim2.new(0, 38, 0, 26)
+PresetLayout.CellPadding = UDim2.new(0, 6, 0, 6)
+PresetLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local presetButtons = {}
+for i, c in ipairs(colorPresets) do
+    local btn = Instance.new("TextButton", PresetGrid)
+    btn.Text = ""
+    btn.AutoButtonColor = false
+    btn.BackgroundColor3 = c
+    btn.LayoutOrder = i
+    applyCorner(btn, 6)
+    applyStroke(btn, Color3.fromRGB(90, 90, 105), 1)
+    presetButtons[i] = btn
+end
 
 local WarnaStatus = Instance.new("TextLabel", WarnaTab)
-WarnaStatus.Size = UDim2.new(1, 0, 0, 26)
+WarnaStatus.Size = UDim2.new(1, -6, 0, 26)
 WarnaStatus.BackgroundTransparency = 1
 WarnaStatus.TextColor3 = Color3.fromRGB(160, 160, 170)
 WarnaStatus.Font = Enum.Font.GothamBold
 WarnaStatus.TextSize = 11
+WarnaStatus.TextWrapped = true
 WarnaStatus.Text = "Status: OFF"
-WarnaStatus.LayoutOrder = 4
+WarnaStatus.LayoutOrder = 8
 
 local Bubble = Instance.new("TextButton", ScreenGui)
 Bubble.Size = UDim2.new(0, 56, 0, 56)
@@ -516,41 +786,104 @@ local function setAttackHoldVisible()
 end
 
 ---------------------------------------------------
+-- STRUCTURAL PROP ACQUISITION
+-- Urutan prop DIJAGA tetap (prop lama tidak dipindah-pindah),
+-- jadi segmen badan tidak tertukar tiap re-scan.
+---------------------------------------------------
+local function updateProps()
+    local folder = workspace:FindFirstChild("WorkspaceCom")
+    if not folder then return end
+    local cone = folder:FindFirstChild("001_TrafficCones")
+    if not cone then return end
+
+    local pname = player.Name
+    local propName = "Prop" .. pname
+    local found = {}
+    local changed = false
+
+    for _, v in ipairs(cone:GetChildren()) do
+        local n = v.Name
+        if n == propName or string.find(n, pname, 1, true) then
+            local remote = v:FindFirstChild("SetCurrentCFrame")
+            local id = v:GetAttribute("id")
+            local category = id and CAT_BY_ID[id]
+            if remote and category then
+                found[remote] = true
+                if not knownProp[remote] then
+                    knownProp[remote] = category
+                    table.insert(Cat[category], remote)
+                    colorOf[remote] = v:FindFirstChild("ChangePropColor")
+                    changed = true
+                end
+            end
+        end
+    end
+
+    for remote, category in pairs(knownProp) do
+        if not found[remote] then
+            knownProp[remote] = nil
+            colorOf[remote] = nil
+            local list = Cat[category]
+            local idx = table.find(list, remote)
+            if idx then table.remove(list, idx) end
+            changed = true
+        end
+    end
+
+    if changed then
+        colorDirty = true
+    end
+end
+
+---------------------------------------------------
 -- SPAWN ANIMATION
+-- Kepala + "atas" (UP) dihitung dari awal supaya badan tidak kebalik:
+--   RISE/SPIRAL: kepala hadap atas, punggung menghadap BELAKANG, lalu tegak ke depan
+--   DROP: kepala hadap bawah, punggung menghadap DEPAN, lalu tarik naik ke depan
 ---------------------------------------------------
 local function beginSpawnAnimation()
     if not hrp then return end
-    spawnAnimEndPos = hrp.Position + Vector3.new(0, 8, 0)
-    spawnAnimEndDir = hrp.CFrame.LookVector
-    if spawnAnimEndDir.Magnitude < 0.001 then
-        spawnAnimEndDir = Vector3.new(0, 0, 1)
+    updateProps()
+    lastUpdate = os.clock()
+
+    local look = hrp.CFrame.LookVector
+    local flat = Vector3.new(look.X, 0, look.Z)
+    if flat.Magnitude < 0.001 then
+        flat = Vector3.new(0, 0, 1)
     end
+    flat = flat.Unit
+
+    spawnAnimEndPos = hrp.Position + Vector3.new(0, 8, 0)
+    spawnAnimEndDir = flat
 
     if not SpawnAnimEnabled then
         dragonPos = spawnAnimEndPos
-        smoothHeadDir = spawnAnimEndDir
-        HeadDir = spawnAnimEndDir
-        table.clear(Seg)
+        smoothHeadDir = flat
+        HeadDir = flat
+        HeadUp = WORLD_UP
+        layStraight(dragonPos, flat)
         spawnAnimActive = false
         return
     end
 
     spawnAnimActive = true
-    spawnAnimStart = tick()
+    spawnAnimStart = os.clock()
     spawnAnimSpiralAngle = 0
 
     if SpawnAnimType == 1 or SpawnAnimType == 2 then
         spawnAnimStartPos = hrp.Position + Vector3.new(0, -40, 0)
         spawnAnimStartDir = Vector3.new(0, 1, 0)
-    elseif SpawnAnimType == 3 then
+        HeadUp = -flat
+    else
         spawnAnimStartPos = hrp.Position + Vector3.new(0, 60, 0)
         spawnAnimStartDir = Vector3.new(0, -1, 0)
+        HeadUp = flat
     end
 
     dragonPos = spawnAnimStartPos
     smoothHeadDir = spawnAnimStartDir
     HeadDir = spawnAnimStartDir
-    table.clear(Seg)
+    layStraight(dragonPos, spawnAnimStartDir)
 end
 
 local function setSpawnType(n)
@@ -563,6 +896,149 @@ local function setSpawnType(n)
         SpawnTypeBtn.Text = "TYPE: DROP"
     end
 end
+
+local function toggleButtonVisual(btn, state, onText, offText, onColor)
+    btn.Text = state and onText or offText
+    if state then
+        TweenService:Create(btn, TweenInfo.new(0.3), {BackgroundColor3 = onColor or Color3.fromRGB(40, 150, 60)}):Play()
+    else
+        TweenService:Create(btn, TweenInfo.new(0.3), {BackgroundColor3 = Color3.fromRGB(40, 40, 45)}):Play()
+    end
+end
+
+---------------------------------------------------
+-- WARNA (roda warna + mode)
+---------------------------------------------------
+local function pushColor(propRemote, color)
+    local c = colorOf[propRemote]
+    if c then
+        pushRemote(c, color)
+    end
+end
+
+local function colorAt(index, now)
+    if ColorMode == "SOLID" then
+        return Color3.fromHSV(pickH, pickS, pickV)
+    elseif ColorMode == "RAINBOW" then
+        return Color3.fromHSV((pickH + now * 0.12) % 1, 1, pickV)
+    else -- FLOW: gradasi pelangi mengalir sepanjang badan
+        return Color3.fromHSV((pickH + now * 0.10 + index * 0.05) % 1, 1, pickV)
+    end
+end
+
+local function applyColors(now)
+    if ColorMode == "OFF" then return end
+    if TargetBody and not LoopColorEnabled then
+        for _, r in ipairs(headDead) do pushColor(r, colorAt(0, now)) end
+        for i, r in ipairs(Props) do pushColor(r, colorAt(i, now)) end
+    end
+    if TargetAccent then
+        for _, r in ipairs(headEgg) do pushColor(r, colorAt(0, now)) end
+        for _, r in ipairs(headTube) do pushColor(r, colorAt(0, now)) end
+        for i, r in ipairs(moonProps) do pushColor(r, colorAt(i, now)) end
+    end
+end
+
+local function refreshColorUI()
+    local c = Color3.fromHSV(pickH, pickS, pickV)
+    PreviewSwatch.BackgroundColor3 = c
+    PreviewText.Text = string.format("RGB %d, %d, %d", math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
+    BrightKnob.Position = UDim2.new(pickV, 0, 0.5, 0)
+    BrightGrad.Color = ColorSequence.new(Color3.new(0, 0, 0), Color3.fromHSV(pickH, pickS, 1))
+    local ang = pickH * math.pi * 2
+    local rad = pickS * WHEEL_MAX_R
+    WheelMarker.Position = UDim2.new(0, WHEEL_C + math.cos(ang) * rad - 12, 0, WHEEL_C - math.sin(ang) * rad - 12)
+
+    local txt = "Mode: " .. ColorMode
+    if ColorMode ~= "OFF" and not Enabled then
+        txt = txt .. " (nyalakan DRAGON dulu)"
+    end
+    WarnaStatus.Text = txt
+    WarnaStatus.TextColor3 = (ColorMode == "OFF") and Color3.fromRGB(160, 160, 170) or Color3.fromRGB(120, 255, 160)
+end
+
+local function updateModeButtons()
+    for name, btn in pairs(modeButtons) do
+        btn.BackgroundColor3 = (ColorMode == name) and GREEN or IDLE
+    end
+    refreshColorUI()
+end
+
+local function onColorChanged()
+    if ColorMode == "OFF" then
+        ColorMode = "SOLID"
+        updateModeButtons()
+    end
+    colorDirty = true
+    refreshColorUI()
+end
+
+pickWheel = function(h, s)
+    pickH, pickS = h, s
+    onColorChanged()
+end
+
+for i, btn in ipairs(presetButtons) do
+    btn.MouseButton1Click:Connect(function()
+        local h, s, v = colorPresets[i]:ToHSV()
+        pickH, pickS, pickV = h, s, v
+        onColorChanged()
+    end)
+end
+
+for name, btn in pairs(modeButtons) do
+    btn.MouseButton1Click:Connect(function()
+        ColorMode = name
+        colorDirty = true
+        updateModeButtons()
+    end)
+end
+
+TgtBodyBtn.MouseButton1Click:Connect(function()
+    TargetBody = not TargetBody
+    toggleButtonVisual(TgtBodyBtn, TargetBody, "BADAN: ON", "BADAN: OFF", GREEN)
+    colorDirty = true
+end)
+
+TgtAccentBtn.MouseButton1Click:Connect(function()
+    TargetAccent = not TargetAccent
+    toggleButtonVisual(TgtAccentBtn, TargetAccent, "AKSEN: ON", "AKSEN: OFF", GREEN)
+    colorDirty = true
+end)
+
+-- slider TERANG (aman untuk sentuh: scroll dimatikan saat geser)
+local sliderDragging, sliderInput = false, nil
+
+local function setBrightFromX(x)
+    local w = BrightTrack.AbsoluteSize.X
+    if w <= 0 then return end
+    pickV = math.clamp((x - BrightTrack.AbsolutePosition.X) / w, 0, 1)
+    onColorChanged()
+end
+
+BrightTrack.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        sliderDragging = true
+        sliderInput = input
+        WarnaTab.ScrollingEnabled = false
+        setBrightFromX(input.Position.X)
+    end
+end)
+
+track(UIS.InputChanged:Connect(function(input)
+    if not sliderDragging then return end
+    if input == sliderInput or input.UserInputType == Enum.UserInputType.MouseMovement then
+        setBrightFromX(input.Position.X)
+    end
+end))
+
+track(UIS.InputEnded:Connect(function(input)
+    if sliderDragging and input == sliderInput then
+        sliderDragging = false
+        sliderInput = nil
+        WarnaTab.ScrollingEnabled = true
+    end
+end))
 
 ---------------------------------------------------
 -- GUI EVENT HANDLERS
@@ -602,6 +1078,7 @@ Bubble.MouseButton1Click:Connect(function()
 end)
 
 Close.MouseButton1Click:Connect(function()
+    alive = false
     Enabled = false
     setAttack(false)
     flushNetwork()
@@ -609,6 +1086,10 @@ Close.MouseButton1Click:Connect(function()
     pcall(function()
         RunService:UnbindFromRenderStep("DragonControlSystem")
     end)
+    if netConn then netConn:Disconnect() end
+    for _, c in ipairs(conns) do
+        pcall(function() c:Disconnect() end)
+    end
     if camPart then camPart:Destroy() end
     ScreenGui:Destroy()
 end)
@@ -627,11 +1108,11 @@ AttackHold.InputEnded:Connect(function(input)
     end
 end)
 
-UIS.InputEnded:Connect(function(input)
+track(UIS.InputEnded:Connect(function(input)
     if attackPointer and input == attackPointer then
         setAttack(false)
     end
-end)
+end))
 
 local function enableTp()
     TeleportEnabled = true
@@ -641,15 +1122,6 @@ end
 local function disableTp()
     TeleportEnabled = false
     if humanoid then humanoid.PlatformStand = false end
-end
-
-local function toggleButtonVisual(btn, state, onText, offText, onColor)
-    btn.Text = state and onText or offText
-    if state then
-        TweenService:Create(btn, TweenInfo.new(0.3), {BackgroundColor3 = onColor or Color3.fromRGB(40, 150, 60)}):Play()
-    else
-        TweenService:Create(btn, TweenInfo.new(0.3), {BackgroundColor3 = Color3.fromRGB(40, 40, 45)}):Play()
-    end
 end
 
 TpBtn.MouseButton1Click:Connect(function()
@@ -675,6 +1147,8 @@ Toggle.MouseButton1Click:Connect(function()
         lastUpdate = 0
         fireWasHidden = false
         laserSpinAngle = 0
+        jawOpen = 0
+        colorDirty = true
         beginSpawnAnimation()
         if CamEnabled then
             applyDragonCam()
@@ -683,12 +1157,14 @@ Toggle.MouseButton1Click:Connect(function()
         setAttack(false)
         flushNetwork()
         table.clear(Seg)
+        table.clear(BodyUp)
         spawnAnimActive = false
         laserSpinAngle = 0
         if CamEnabled then
             restorePlayerCam()
         end
     end
+    refreshColorUI()
 end)
 
 StopMoveBtn.MouseButton1Click:Connect(function()
@@ -699,6 +1175,7 @@ end)
 ColorBtn.MouseButton1Click:Connect(function()
     LoopColorEnabled = not LoopColorEnabled
     toggleButtonVisual(ColorBtn, LoopColorEnabled, "LOOP COLOR: ON", "LOOP COLOR: OFF", Color3.fromRGB(120, 30, 150))
+    colorDirty = true
 end)
 
 FollowBtn.MouseButton1Click:Connect(function()
@@ -716,113 +1193,36 @@ SpawnTypeBtn.MouseButton1Click:Connect(function()
 end)
 
 ---------------------------------------------------
--- CUSTOM COLOR
----------------------------------------------------
-local function applyCustomColor(color)
-    CustomColorEnabled = true
-    CustomColorValue = color
-    for _, r in ipairs(customColorRemotes) do
-        pushRemote(r, color)
-    end
-    WarnaStatus.Text = string.format("Status: ON (RGB %d,%d,%d)", math.floor(color.R*255), math.floor(color.G*255), math.floor(color.B*255))
-    WarnaStatus.TextColor3 = Color3.fromRGB(120, 255, 160)
-end
-
-for i, preset in ipairs(colorPresets) do
-    colorButtons[i].MouseButton1Click:Connect(function()
-        applyCustomColor(preset.color)
-    end)
-end
-
-CustomColorOffBtn.MouseButton1Click:Connect(function()
-    CustomColorEnabled = false
-    WarnaStatus.Text = "Status: OFF"
-    WarnaStatus.TextColor3 = Color3.fromRGB(160, 160, 170)
-end)
-
----------------------------------------------------
--- STRUCTURAL PROP ACQUISITION
----------------------------------------------------
-local function updateProps()
-    table.clear(Props)
-    table.clear(headDead)
-    table.clear(headTube)
-    table.clear(headEgg)
-    table.clear(moonProps)
-    table.clear(tailCone)
-    table.clear(fireProps)
-    table.clear(ColorRemotes)
-    table.clear(customColorRemotes)
-    table.clear(headSeat)
-
-    local folder = workspace:FindFirstChild("WorkspaceCom")
-    if not folder then return end
-
-    local cone = folder:FindFirstChild("001_TrafficCones")
-    if not cone then return end
-
-    local pname = player.Name
-    local propName = "Prop" .. pname
-
-    for _, v in ipairs(cone:GetChildren()) do
-        local n = v.Name
-        if n == propName or string.find(n, pname, 1, true) then
-            local remote = v:FindFirstChild("SetCurrentCFrame")
-            local id = v:GetAttribute("id")
-            if remote and id then
-                if id == "DeadGraveBlood" then
-                    table.insert(headDead, remote)
-                    local colorRemote = v:FindFirstChild("ChangePropColor")
-                    if colorRemote then table.insert(ColorRemotes, colorRemote) end
-                elseif id == "TubeLamp" then
-                    table.insert(headTube, remote)
-                    local colorRemote = v:FindFirstChild("ChangePropColor")
-                    if colorRemote then table.insert(customColorRemotes, colorRemote) end
-                elseif id == "EggLamp" then
-                    table.insert(headEgg, remote)
-                    local colorRemote = v:FindFirstChild("ChangePropColor")
-                    if colorRemote then table.insert(customColorRemotes, colorRemote) end
-                elseif id == "Cylinder" then
-                    table.insert(Props, remote)
-                    local colorRemote = v:FindFirstChild("ChangePropColor")
-                    if colorRemote then table.insert(ColorRemotes, colorRemote) end
-                elseif id == "GirlyShapeMoon" then
-                    table.insert(moonProps, remote)
-                    local colorRemote = v:FindFirstChild("ChangePropColor")
-                    if colorRemote then table.insert(customColorRemotes, colorRemote) end
-                elseif id == "Cone" then
-                    table.insert(tailCone, remote)
-                elseif id == "LightsSpotLightRed" then
-                    table.insert(fireProps, remote)
-                elseif id == PROP_ID_SEAT then
-                    table.insert(headSeat, remote)
-                end
-            end
-        end
-    end
-
-    if CustomColorEnabled then
-        for _, r in ipairs(customColorRemotes) do
-            pushRemote(r, CustomColorValue)
-        end
-    end
-end
-
----------------------------------------------------
--- LOOP COLOR
+-- THREAD WARNA (loop color lama + mode warna baru)
 ---------------------------------------------------
 task.spawn(function()
-    local colors = { Color3.fromRGB(120, 0, 0), Color3.fromRGB(0, 0, 0) }
-    local colorIndex = 1
-    while true do
-        if LoopColorEnabled and Enabled and #ColorRemotes > 0 then
-            local targetColor = colors[colorIndex]
-            for _, colorRem in ipairs(ColorRemotes) do
-                pushRemote(colorRem, targetColor)
+    local loopColors = { Color3.fromRGB(120, 0, 0), Color3.fromRGB(0, 0, 0) }
+    local loopIndex = 1
+    local lastLoop, lastStep = 0, 0
+    while alive do
+        task.wait(0.1)
+        if Enabled then
+            local now = os.clock()
+
+            if LoopColorEnabled and now - lastLoop >= 0.5 then
+                lastLoop = now
+                local c = loopColors[loopIndex]
+                loopIndex = (loopIndex == 1) and 2 or 1
+                for _, r in ipairs(headDead) do pushColor(r, c) end
+                for _, r in ipairs(Props) do pushColor(r, c) end
             end
-            colorIndex = colorIndex == 1 and 2 or 1
+
+            if ColorMode == "SOLID" then
+                if colorDirty then
+                    colorDirty = false
+                    applyColors(now)
+                end
+            elseif ColorMode ~= "OFF" and now - lastStep >= 0.25 then
+                lastStep = now
+                colorDirty = false
+                applyColors(now)
+            end
         end
-        task.wait(0.5)
     end
 end)
 
@@ -853,12 +1253,13 @@ end
 ---------------------------------------------------
 -- MAIN RENDER LOOP
 ---------------------------------------------------
-RunService:BindToRenderStep("DragonControlSystem", 199, function(dt)
+RunService:BindToRenderStep("DragonControlSystem", 199, function(rawDt)
     if not Enabled then return end
+    local dt = math.min(rawDt, 0.1) -- cegah loncat besar kalau FPS drop
 
-    if tick() - lastUpdate > updateDelay then
+    if os.clock() - lastUpdate > updateDelay then
         updateProps()
-        lastUpdate = tick()
+        lastUpdate = os.clock()
     end
 
     if #Props == 0 and #headDead == 0 then return end
@@ -869,9 +1270,9 @@ RunService:BindToRenderStep("DragonControlSystem", 199, function(dt)
 
     local camCF = camera.CFrame
 
-    -- ANIMASI SPAWN
+    -- ===== GERAK KEPALA =====
     if spawnAnimActive then
-        local t = math.clamp((tick() - spawnAnimStart) / SpawnAnimDuration, 0, 1)
+        local t = math.clamp((os.clock() - spawnAnimStart) / SpawnAnimDuration, 0, 1)
         local ease = 1 - (1 - t) ^ 3
         local pos = spawnAnimStartPos:Lerp(spawnAnimEndPos, ease)
 
@@ -900,36 +1301,36 @@ RunService:BindToRenderStep("DragonControlSystem", 199, function(dt)
             smoothHeadDir = spawnAnimEndDir
             HeadDir = spawnAnimEndDir
         end
-
     else
         if FollowPlayerEnabled and hrp then
             HeadDir = hrp.CFrame.LookVector
             local targetPos = (hrp.CFrame * CFrame.new(0, 10, 3)).Position
-            dragonPos = dragonPos:Lerp(targetPos, 0.2)
+            dragonPos = dragonPos:Lerp(targetPos, alphaDt(0.2, dt))
         else
             local move = humanoid and humanoid.MoveDirection or Vector3.zero
             local flyDir = getJoystickFlyDir(camCF, move)
             if flyDir then
                 HeadDir = flyDir
-                dragonPos += flyDir * baseSpeed * math.min(move.Magnitude, 1)
+                -- baseSpeed dihitung "per frame @60fps", dikali dt supaya sama di FPS berapa pun
+                dragonPos += flyDir * (baseSpeed * 60) * dt * math.min(move.Magnitude, 1)
             end
         end
 
-        smoothHeadDir = smoothHeadDir:Lerp(HeadDir, headTurnSpeed)
-        if smoothHeadDir.Magnitude > 0.001 then
-            smoothHeadDir = smoothHeadDir.Unit
-        end
-        Seg[1] = Seg[1] and Seg[1]:Lerp(dragonPos, 0.35) or dragonPos
+        smoothHeadDir = slerpDir(smoothHeadDir, HeadDir, alphaDt(headTurnSpeed, dt))
+        Seg[1] = Seg[1] and Seg[1]:Lerp(dragonPos, alphaDt(0.35, dt)) or dragonPos
     end
 
-    -- TAIL: clamp cur ke prev dulu agar selalu valid → tidak ada prop yang snap/terpisah
+    -- "atas" kepala dibawa terus (tidak pernah flip walau tegak lurus)
+    updateHeadUp(dt)
+
+    -- ===== EKOR / BADAN (follow-the-leader) =====
+    local tailAlpha = alphaDt(tailSmoothness, dt)
     local totalSegments = #Props + 1
     for i = 2, totalSegments do
         local prev = Seg[i - 1]
         local cur = Seg[i] or prev
-        local currentDistance = (i == 2) and (TAIL_SEGMENT_DISTANCE + 2) or TAIL_SEGMENT_DISTANCE
+        local currentDistance = segGap(i)
 
-        -- CLAMP cur agar selalu dekat prev (cegah kepisah saat naga lari cepat)
         local curDelta = prev - cur
         if curDelta.Magnitude > currentDistance then
             cur = prev - (curDelta.Unit * currentDistance)
@@ -944,9 +1345,8 @@ RunService:BindToRenderStep("DragonControlSystem", 199, function(dt)
         end
 
         local target = prev - (d * currentDistance)
-        local newPos = cur:Lerp(target, tailSmoothness)
+        local newPos = cur:Lerp(target, tailAlpha)
 
-        -- Pastikan tidak melebihi jarak max
         local constraintDelta = prev - newPos
         if constraintDelta.Magnitude > currentDistance then
             newPos = prev - (constraintDelta.Unit * currentDistance)
@@ -955,11 +1355,13 @@ RunService:BindToRenderStep("DragonControlSystem", 199, function(dt)
         Seg[i] = newPos
     end
 
-    local headBase = computeHeadBase(Seg[1], smoothHeadDir)
+    -- ===== KEPALA =====
+    local headBase = makeFrame(Seg[1], smoothHeadDir, HeadUp) * CFrame.Angles(0, math.rad(180), 0)
 
-    local jawCF = AttackEnabled
-        and (headBase * CFrame.new(0, -2.5, -0.5) * CFrame.Angles(math.rad(115), 0, 0))
-        or (headBase * CFrame.new(0, -2.5, 0) * CFrame.Angles(math.rad(90), 0, 0))
+    jawOpen += ((AttackEnabled and 1 or 0) - jawOpen) * alphaDt(0.3, dt)
+    local jawCF = headBase
+        * CFrame.new(0, -2.5, -0.5 * jawOpen)
+        * CFrame.Angles(math.rad(90 + 25 * jawOpen), 0, 0)
 
     local cfa1 = headBase * CFrame.new(0, 2.5, -2.5) * CFrame.Angles(math.rad(100), 0, 0)
     local cfa2 = headBase * CFrame.new(0, 0, 0) * CFrame.Angles(math.rad(90), 0, 0)
@@ -985,11 +1387,7 @@ RunService:BindToRenderStep("DragonControlSystem", 199, function(dt)
     end
 
     -----------------------------------------------------------
-    -- LASER: hadap DEPAN kepala (bukan belakang)
-    -- headBase punya rotasi 180°Y → forward -Z = -lookDir (belakang)
-    -- Tambah Angles(0, 180°, 0) SETELAH LASER_OFFSET → balik ke hadap depan
-    -- Posisi tetap di mulut, tidak berubah karena LASER_OFFSET translasi only
-    -- Drill spin Y lokal setelah LASER_PART_FIX (poros hadap)
+    -- LASER: hadap DEPAN kepala
     -----------------------------------------------------------
     if AttackEnabled then
         fireWasHidden = false
@@ -1002,8 +1400,7 @@ RunService:BindToRenderStep("DragonControlSystem", 199, function(dt)
         for i, fireRemote in ipairs(fireProps) do
             local phase = (i - 1) * (math.pi * 2 / count)
             local totalY = laserSpinAngle + phase
-            local finalCF = baseFrame * CFrame.Angles(0, totalY, 0)
-            pushRemote(fireRemote, finalCF)
+            pushRemote(fireRemote, baseFrame * CFrame.Angles(0, totalY, 0))
         end
     elseif not fireWasHidden then
         fireWasHidden = true
@@ -1014,18 +1411,25 @@ RunService:BindToRenderStep("DragonControlSystem", 199, function(dt)
         end
     end
 
+    -- ===== BADAN: "atas" diwariskan dari kepala sampai ekor =====
+    local prevUp = HeadUp
     for i, v in ipairs(Props) do
         local pos = Seg[i + 1]
-        local nextPos = Seg[i] or pos
-        if pos then
-            local dir = (nextPos - pos)
+        local nextPos = Seg[i]
+        if pos and nextPos then
+            local dir = nextPos - pos
             if dir.Magnitude > 0.001 then
                 dir = dir.Unit
-                pushRemote(v, stableLookAt(pos, dir) * CFrame.Angles(math.rad(-90), 0, 0))
+                local up = projectUp(prevUp, dir, BodyUp[i])
+                BodyUp[i] = up
+                prevUp = up
+
+                pushRemote(v, makeFrame(pos, dir, up) * CFrame.Angles(math.rad(-90), 0, 0))
+
                 if moonProps[i] then
                     pushRemote(
                         moonProps[i],
-                        stableLookAt(pos + Vector3.new(0, 1, 0), dir)
+                        makeFrame(pos + up, dir, up)
                             * CFrame.Angles(math.rad(30), math.rad(-90), 0)
                             * CFrame.new(-3, -2, 0)
                     )
@@ -1038,10 +1442,13 @@ RunService:BindToRenderStep("DragonControlSystem", 199, function(dt)
         local pos = Seg[#Seg]
         local lastSegmentDir = (Seg[#Seg] - Seg[#Seg - 1])
         if lastSegmentDir.Magnitude > 0.001 then
-            pushRemote(tailCone[1], stableLookAt(pos, lastSegmentDir.Unit) * CFrame.Angles(math.rad(-90), 0, 0))
+            local dir = lastSegmentDir.Unit
+            local up = projectUp(prevUp, dir, BodyUp[#Props])
+            pushRemote(tailCone[1], makeFrame(pos, dir, up) * CFrame.Angles(math.rad(-90), 0, 0))
         end
     end
 
+    -- ===== TELEPORT & KAMERA =====
     if TeleportEnabled and hrp then
         local head = Seg[1] or dragonPos
         local dir = clampDirection(smoothHeadDir)
@@ -1062,3 +1469,4 @@ end)
 
 selectTab(1)
 setSpawnType(SpawnAnimType)
+updateModeButtons()
