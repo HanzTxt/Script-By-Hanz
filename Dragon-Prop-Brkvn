@@ -1,6 +1,6 @@
 -- ==============================================================================
 -- DRAGON CONTROL SCRIPT V4 - GUI REVAMP + ANIMATED DRAGON + LOADING SCREEN
--- BY | HANZz
+-- BY | HANZzz
 -- ==============================================================================
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
