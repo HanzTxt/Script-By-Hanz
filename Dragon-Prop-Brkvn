@@ -1,7 +1,6 @@
--- ===============================================================================
+-- ==============================================================================
 -- DRAGON CONTROL SCRIPT V4 - GUI REVAMP + ANIMATED DRAGON + LOADING SCREEN
 -- BY | HANZ
--- (Logika dragon / network / warna / kamera TIDAK diubah, hanya GUI)
 -- ==============================================================================
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -237,11 +236,8 @@ local THEME = {
 -- ================================  GUI V4  ====================================
 -- ==============================================================================
 
-local Main -- forward declare (dipakai loading screen)
+local Main
 
----------------------------------------------------
--- GUI KIT: helper kecil
----------------------------------------------------
 local function corner(g, r)
     local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, r or 6); c.Parent = g; return c
 end
@@ -257,7 +253,6 @@ local function pad(g, p)
     u.PaddingLeft = UDim.new(0,p); u.PaddingRight = UDim.new(0,p)
     u.Parent = g; return u
 end
--- frame kecil berpusat (dipakai untuk menggambar naga dari bentuk UI)
 local function part(parent, w, h, color, z, rnd)
     local f = Instance.new("Frame")
     f.AnchorPoint = Vector2.new(0.5,0.5)
@@ -273,7 +268,7 @@ local function part(parent, w, h, color, z, rnd)
 end
 
 ---------------------------------------------------
--- NAGA ANIMASI (digambar dari Frame, tanpa emoji / asset)
+-- NAGA ANIMASI
 ---------------------------------------------------
 local COL_BODY_A = Color3.fromRGB(210,45,40)
 local COL_BODY_B = Color3.fromRGB(95,14,34)
@@ -300,7 +295,6 @@ local function bindAnim(holder, fn, isActive)
     track(conn)
 end
 
--- naga ular samping: badan bergelombang, tanduk, duri, sayap (opsional), napas api
 local function newDragonArt(parent, W, H, o)
     o = o or {}
     local N = o.segments or 14
@@ -317,7 +311,6 @@ local function newDragonArt(parent, W, H, o)
     holder.Size = UDim2.new(0,W,0,H)
     holder.Parent = parent
 
-    -- sayap
     local bones, wingLines, boneLen = {}, {}, {}
     if o.wings then
         local L = H*0.42
@@ -334,7 +327,6 @@ local function newDragonArt(parent, W, H, o)
         end
     end
 
-    -- badan + duri punggung
     local segs, spikes, segSize = {}, {}, {}
     for k = 1, N do
         local s = (hs*0.8) * (1 - 0.72*(k/N)) + 3
@@ -353,7 +345,6 @@ local function newDragonArt(parent, W, H, o)
         end
     end
 
-    -- kepala
     local hz = 3*N + 10
     local head = part(holder, hs*1.8, hs*0.95, COL_BODY_A, hz, 0.4)
     local function sub(par, w, h, color, rnd, px, py, z)
@@ -374,7 +365,6 @@ local function newDragonArt(parent, W, H, o)
     local eye = sub(head, hs*0.34, hs*0.22, COL_FIRE1, 0.5, 0.55, 0.3, 4)
     sub(eye, 2, hs*0.18, Color3.fromRGB(20,0,0), 0.5, 0.5, 0.5, 1)
 
-    -- api
     local flames = {}
     for j = 1, (o.flames or 8) do
         local p = part(holder, 4, 4, COL_FIRE1, hz+2, 0.5)
@@ -418,7 +408,6 @@ local function newDragonArt(parent, W, H, o)
             end
         end
 
-        -- rahang, tanduk, kumis, mata
         local mouth = 0.5 + 0.5*math.sin(t*2.4)
         jaw.Rotation = 4 + (atk and 1 or mouth*0.6)*24
         horn1.Rotation = 205 + 4*math.sin(t*3)
@@ -428,7 +417,6 @@ local function newDragonArt(parent, W, H, o)
         eye.Size = UDim2.new(0, hs*0.34, 0, hs*0.22*blink)
         eye.BackgroundColor3 = COL_FIRE1:Lerp(COL_FIRE2, 0.5 + 0.5*math.sin(t*3))
 
-        -- napas api
         if o.fire ~= false then
             local inten = atk and 1 or (math.clamp(math.sin(t*0.9)*1.6 + 0.4, 0, 1) * 0.85)
             local mx = hx + ca*hs*1.0 - sa*hs*0.1
@@ -449,7 +437,6 @@ local function newDragonArt(parent, W, H, o)
             end
         end
 
-        -- sayap mengepak
         if o.wings then
             local sx, sy = spine(3)
             sy = sy - segSize[3]*0.3
@@ -478,7 +465,6 @@ local function newDragonArt(parent, W, H, o)
     return holder
 end
 
--- wajah naga tampak depan (ikon kecil): mata menyala, kedip, tanduk bergoyang
 local function newDragonFace(parent, S, mood, isActive)
     local wrap = Instance.new("Frame")
     wrap.BackgroundTransparency = 1
@@ -529,7 +515,7 @@ local function newDragonFace(parent, S, mood, isActive)
 end
 
 ---------------------------------------------------
--- LOADING SCREEN (naga bergerak + sayap + api)
+-- LOADING SCREEN
 ---------------------------------------------------
 local LoadingGui = Instance.new("ScreenGui")
 LoadingGui.Name = "DragonLoadingGui"
@@ -539,7 +525,7 @@ LoadingGui.DisplayOrder = 999
 LoadingGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 LoadingGui.Parent = player:WaitForChild("PlayerGui")
 
-local LBack = Instance.new("CanvasGroup") -- CanvasGroup: seluruh isi bisa fade bareng
+local LBack = Instance.new("CanvasGroup")
 LBack.Size = UDim2.new(1,0,1,0)
 LBack.BackgroundColor3 = Color3.fromRGB(4,2,6)
 LBack.BorderSizePixel = 0
@@ -566,7 +552,6 @@ LGlowGrad.Transparency = NumberSequence.new{
     NumberSequenceKeypoint.new(1,1),
 }
 
--- percikan api naik
 local embers = {}
 for i = 1, 26 do
     local s = math.random(2, 5)
@@ -574,7 +559,6 @@ for i = 1, 26 do
     embers[i] = { f = e, x = math.random(), spd = 0.08 + math.random()*0.16, ph = math.random(), sw = 8 + math.random()*24 }
 end
 
--- naga besar
 local LDragon = newDragonArt(LBack, 400, 200, {
     segments = 19, head = 36, amp = 42, headX = 290, fireLen = 100, wings = true, flames = 10,
     mood = function() return true, false end,
@@ -644,7 +628,6 @@ LPct.TextSize = 12
 LPct.TextColor3 = THEME.accentOrange
 LPct.Text = "0%"
 
--- animasi loading: ember + judul berdenyut
 bindAnim(LBack, function(dt, t)
     for _, em in ipairs(embers) do
         local f = (t*em.spd + em.ph) % 1
@@ -709,15 +692,23 @@ Main.Active = true
 Main.Draggable = true
 Main.BorderSizePixel = 0
 Main.ClipsDescendants = true
-Main.Visible = false -- tampil setelah loading
+Main.Visible = true
 Main.Parent = ScreenGui
 corner(Main, 12)
+
+task.delay(5, function()
+    if LoadingGui and LoadingGui.Parent then
+        LoadingGui:Destroy()
+    end
+    if Main and Main.Parent then
+        Main.Visible = true
+    end
+end)
 
 local MainBg = Instance.new("UIGradient", Main)
 MainBg.Rotation = 90
 MainBg.Color = ColorSequence.new(Color3.fromRGB(20,12,22), Color3.fromRGB(8,6,12))
 
--- border api yang berputar
 local MainStroke = stroke(Main, Color3.new(1,1,1), 1.5)
 local MainStrokeGrad = Instance.new("UIGradient", MainStroke)
 MainStrokeGrad.Color = ColorSequence.new{
@@ -728,7 +719,6 @@ MainStrokeGrad.Color = ColorSequence.new{
     ColorSequenceKeypoint.new(1,    Color3.fromRGB(200,40,40)),
 }
 
--- animasi pop saat GUI muncul
 local MainPop = Instance.new("UIScale", Main)
 track(Main:GetPropertyChangedSignal("Visible"):Connect(function()
     if Main.Visible then
@@ -737,7 +727,6 @@ track(Main:GetPropertyChangedSignal("Visible"):Connect(function()
     end
 end))
 
--- topbar
 local TopBar = Instance.new("Frame", Main)
 TopBar.Size = UDim2.new(1,0,0,40)
 TopBar.BackgroundColor3 = THEME.bgPanel
@@ -793,7 +782,6 @@ Close.TextColor3 = Color3.new(1,1,1)
 Close.BorderSizePixel = 0
 corner(Close, 8)
 
--- banner naga animasi
 local Banner = Instance.new("Frame", Main)
 Banner.Size = UDim2.new(1, -16, 0, 52)
 Banner.Position = UDim2.new(0, 8, 0, 46)
@@ -841,7 +829,6 @@ ChipText.TextXAlignment = Enum.TextXAlignment.Left
 ChipText.Text = "OFFLINE"
 ChipText.ZIndex = 101
 
--- TAB BAR
 local TabBar = Instance.new("Frame", Main)
 TabBar.Size = UDim2.new(1, -16, 0, 30)
 TabBar.Position = UDim2.new(0, 8, 0, 104)
@@ -916,10 +903,6 @@ TabDragon.MouseButton1Click:Connect(function() selectTab(1) end)
 TabSpawn.MouseButton1Click:Connect(function() selectTab(2) end)
 TabWarna.MouseButton1Click:Connect(function() selectTab(3) end)
 
----------------------------------------------------
--- KOMPONEN GUI
----------------------------------------------------
--- tombol toggle: LED emas di kiri menyala otomatis kalau teks berisi ": ON"
 local function createButton(parent, text, order, accent, noLed)
     local btn = Instance.new("TextButton")
     btn.Size = UDim2.new(1, -6, 0, 36)
@@ -943,7 +926,7 @@ local function createButton(parent, text, order, accent, noLed)
     if not noLed then
         local led = Instance.new("Frame", btn)
         led.AnchorPoint = Vector2.new(0, 0.5)
-        led.Position = UDim2.new(0, -12, 0.5, 0) -- dikompensasi padding kiri 16
+        led.Position = UDim2.new(0, -12, 0.5, 0)
         led.Size = UDim2.new(0, 3, 0, 16)
         led.BackgroundColor3 = Color3.fromRGB(70,55,60)
         led.BorderSizePixel = 0
@@ -989,7 +972,7 @@ local function createSection(parent, text, order)
     p.PaddingLeft = UDim.new(0, 14)
     local dia = Instance.new("Frame", l)
     dia.AnchorPoint = Vector2.new(0.5, 0.5)
-    dia.Position = UDim2.new(0, -9, 0.5, 0) -- dikompensasi padding
+    dia.Position = UDim2.new(0, -9, 0.5, 0)
     dia.Size = UDim2.new(0, 6, 0, 6)
     dia.Rotation = 45
     dia.BackgroundColor3 = THEME.accentRed
@@ -1044,9 +1027,6 @@ local function createInputRow(parent, labelText, defaultVal, order)
     return box
 end
 
----------------------------------------------------
--- TAB 1: DRAGON (urut: master > gerak & kamera > efek > tuning)
----------------------------------------------------
 local Toggle = createButton(DragonTab, "DRAGON: OFF", 1, THEME.accentRed)
 Toggle.Size = UDim2.new(1, -6, 0, 44)
 Toggle:FindFirstChildOfClass("UITextSizeConstraint").MaxTextSize = 15
@@ -1065,9 +1045,6 @@ createSection(DragonTab, "TUNING", 6)
 local SpeedBox = createInputRow(DragonTab, "SPEED", baseSpeed, 7)
 local SpinBox  = createInputRow(DragonTab, "LASER SPIN", LASER_SPIN_SPEED, 8)
 
----------------------------------------------------
--- TAB 2: SPAWN
----------------------------------------------------
 local SpawnAnimBtn = createButton(SpawnTab, "SPAWN ANIM: ON", 1, THEME.green)
 createSection(SpawnTab, "GAYA MUNCUL", 2)
 local SpawnTypeBtn = createButton(SpawnTab, "TYPE: RISE UP", 3, nil, true)
@@ -1094,9 +1071,6 @@ corner(SpawnHelp, 8)
 stroke(SpawnHelp, THEME.borderSoft, 1)
 pad(SpawnHelp, 10)
 
----------------------------------------------------
--- TAB 3: WARNA
----------------------------------------------------
 local WarnaHeader = Instance.new("TextLabel", WarnaTab)
 WarnaHeader.Size = UDim2.new(1, -6, 0, 32)
 WarnaHeader.BackgroundTransparency = 1
@@ -1152,7 +1126,6 @@ WheelMarker.ZIndex = 5
 corner(WheelMarker, 12)
 stroke(WheelMarker, Color3.new(1,1,1), 2)
 
--- slider brightness
 local BrightRow = Instance.new("Frame", WarnaTab)
 BrightRow.Size = UDim2.new(1, -6, 0, 32)
 BrightRow.BackgroundColor3 = THEME.bgPanel
@@ -1193,7 +1166,6 @@ BrightKnob.ZIndex = 3
 corner(BrightKnob, 4)
 stroke(BrightKnob, Color3.fromRGB(20,20,25), 1.5)
 
--- preview
 local PreviewRow = Instance.new("Frame", WarnaTab)
 PreviewRow.Size = UDim2.new(1, -6, 0, 34)
 PreviewRow.BackgroundColor3 = THEME.bgPanel
@@ -1303,7 +1275,6 @@ WarnaStatus.TextWrapped = true
 WarnaStatus.Text = "Status: OFF"
 WarnaStatus.LayoutOrder = 11
 
--- floating bubble (wajah naga animasi, bukan emoji)
 local Bubble = Instance.new("TextButton", ScreenGui)
 Bubble.Size = UDim2.new(0, 56, 0, 56)
 Bubble.Position = UDim2.new(0, 16, 0.5, -28)
@@ -1319,7 +1290,6 @@ local BubbleFace = newDragonFace(Bubble, 42, function() return Enabled end, func
 BubbleFace.Position = UDim2.new(0.5, 0, 0.5, 0)
 BubbleFace.ZIndex = 11
 
--- attack button
 local AttackHold = Instance.new("TextButton", ScreenGui)
 AttackHold.Size = UDim2.new(0, 72, 0, 72)
 AttackHold.Position = UDim2.new(1, -168, 1, -96)
@@ -1351,7 +1321,6 @@ local function setAttackHoldVisible()
     if not Enabled then setAttack(false) end
 end
 
--- efek GUI: border api berputar, chip status, denyut tombol
 local lastChip = -1
 track(RunService.Heartbeat:Connect(function()
     local t = os.clock()
